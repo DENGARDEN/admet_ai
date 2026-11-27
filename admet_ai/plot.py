@@ -1,6 +1,7 @@
 """Defines functions for ADMET-AI plots."""
 
 import re
+import threading
 from io import BytesIO
 
 import matplotlib.pyplot as plt
@@ -14,6 +15,8 @@ from admet_ai.admet_info import (
     get_admet_id_to_units,
     get_admet_name_to_id,
 )
+
+PLOT_LOCK = threading.Lock()
 
 
 def string_to_latex_sup(string: str) -> str:
@@ -55,52 +58,6 @@ def plot_drugbank_reference(
     x_property_id = admet_name_to_id[x_property_name]
     y_property_id = admet_name_to_id[y_property_name]
 
-    # Scatter plot of DrugBank molecules with histogram marginals
-    sns.jointplot(
-        x=drugbank_df[x_property_id],
-        y=drugbank_df[y_property_id],
-        kind="scatter",
-        marginal_kws=dict(bins=50, fill=True),
-        label="DrugBank Reference",
-    )
-
-    # Scatter plot of new molecules
-    if len(preds_df) > 0:
-        sns.scatterplot(
-            x=preds_df[x_property_id],
-            y=preds_df[y_property_id],
-            color="red",
-            marker="*",
-            s=200,
-            label="Input Molecule" + ("s" if len(preds_df) > 1 else ""),
-        )
-
-    # Add molecule numbers
-    if max_molecule_num is not None:
-        # Create buffer around scatter plot points
-        x_min, x_max = plt.xlim()
-        x_range = x_max - x_min
-        x_buffer = x_range * 0.01
-
-        y_min, y_max = plt.ylim()
-        y_range = y_max - y_min
-        y_buffer = y_range * 0.01
-
-        # Get x and y values for first max_molecule_num molecules
-        x_vals = preds_df[x_property_id].values[:max_molecule_num]
-        y_vals = preds_df[y_property_id].values[:max_molecule_num]
-
-        # Add molecule numbers for first max_molecule_num molecules
-        for i, (x_val, y_val) in enumerate(zip(x_vals, y_vals)):
-            plt.text(
-                x_val - x_buffer,
-                y_val + y_buffer,
-                str(i + 1),
-                horizontalalignment="right",
-                verticalalignment="bottom",
-                c="red",
-            )
-
     # Get ADMET property units
     admet_id_to_units = get_admet_id_to_units()
 
@@ -110,16 +67,65 @@ def plot_drugbank_reference(
     x_property_units = x_property_units if x_property_units != "-" else "probability"
     y_property_units = y_property_units if y_property_units != "-" else "probability"
 
-    # Set axis labels
-    plt.xlabel(f"{x_property_name} ({string_to_latex_sup(x_property_units)})")
-    plt.ylabel(f"{y_property_name} ({string_to_latex_sup(y_property_units)})")
+    with PLOT_LOCK:
+        # Scatter plot of DrugBank molecules with histogram marginals
+        grid = sns.jointplot(
+            x=drugbank_df[x_property_id],
+            y=drugbank_df[y_property_id],
+            kind="scatter",
+            marginal_kws=dict(bins=50, fill=True),
+            label="DrugBank Reference",
+        )
 
-    # Save plot as svg to pass to frontend
-    buf = BytesIO()
-    plt.savefig(buf, format=image_type, bbox_inches="tight")
-    plt.close()
-    buf.seek(0)
-    plot = buf.getvalue()
+        try:
+            # Scatter plot of new molecules
+            if len(preds_df) > 0:
+                sns.scatterplot(
+                    x=preds_df[x_property_id],
+                    y=preds_df[y_property_id],
+                    color="red",
+                    marker="*",
+                    s=200,
+                    label="Input Molecule" + ("s" if len(preds_df) > 1 else ""),
+                )
+
+            # Add molecule numbers
+            if max_molecule_num is not None:
+                # Create buffer around scatter plot points
+                x_min, x_max = plt.xlim()
+                x_range = x_max - x_min
+                x_buffer = x_range * 0.01
+
+                y_min, y_max = plt.ylim()
+                y_range = y_max - y_min
+                y_buffer = y_range * 0.01
+
+                # Get x and y values for first max_molecule_num molecules
+                x_vals = preds_df[x_property_id].values[:max_molecule_num]
+                y_vals = preds_df[y_property_id].values[:max_molecule_num]
+
+                # Add molecule numbers for first max_molecule_num molecules
+                for i, (x_val, y_val) in enumerate(zip(x_vals, y_vals)):
+                    plt.text(
+                        x_val - x_buffer,
+                        y_val + y_buffer,
+                        str(i + 1),
+                        horizontalalignment="right",
+                        verticalalignment="bottom",
+                        c="red",
+                    )
+
+            # Set axis labels
+            plt.xlabel(f"{x_property_name} ({string_to_latex_sup(x_property_units)})")
+            plt.ylabel(f"{y_property_name} ({string_to_latex_sup(y_property_units)})")
+
+            # Save plot as svg to pass to frontend
+            buf = BytesIO()
+            plt.savefig(buf, format=image_type, bbox_inches="tight")
+            buf.seek(0)
+            plot = buf.getvalue()
+        finally:
+            plt.close(grid.fig)
 
     return plot
 
@@ -172,44 +178,47 @@ def plot_radial_summary(
     percentiles += percentiles[:1]
     angles += angles[:1]
 
-    # Create a plot
-    fig, ax = plt.subplots(figsize=(3, 3), subplot_kw=dict(polar=True))
+    with PLOT_LOCK:
+        # Create a plot
+        fig, ax = plt.subplots(figsize=(3, 3), subplot_kw=dict(polar=True))
 
-    # Plot the data
-    ax.fill(angles, percentiles, color="red", alpha=0.25)
-    ax.plot(angles, percentiles, color="red", linewidth=2)
+        try:
+            # Plot the data
+            ax.fill(angles, percentiles, color="red", alpha=0.25)
+            ax.plot(angles, percentiles, color="red", linewidth=2)
 
-    # Set y limits
-    ax.set_ylim(0, 100)
+            # Set y limits
+            ax.set_ylim(0, 100)
 
-    # Labels for radial lines
-    yticks = [0, 25, 50, 75, 100]
-    yticklabels = [str(ytick) for ytick in yticks]
-    ax.set_yticks(yticks)
-    ax.set_yticklabels(yticklabels)
-    ax.set_rlabel_position(335)
+            # Labels for radial lines
+            yticks = [0, 25, 50, 75, 100]
+            yticklabels = [str(ytick) for ytick in yticks]
+            ax.set_yticks(yticks)
+            ax.set_yticklabels(yticklabels)
+            ax.set_rlabel_position(335)
 
-    # Labels for categories
-    ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(property_names)
+            # Labels for categories
+            ax.set_xticks(angles[:-1])
+            ax.set_xticklabels(property_names)
 
-    # Adjust xticklabels so they don't overlap the plot
-    for label, property_name in zip(ax.get_xticklabels(), property_names):
-        if "vertical_alignment" in properties[property_name]:
-            label.set_verticalalignment(properties[property_name]["vertical_alignment"])
+            # Adjust xticklabels so they don't overlap the plot
+            for label, property_name in zip(ax.get_xticklabels(), property_names):
+                if "vertical_alignment" in properties[property_name]:
+                    label.set_verticalalignment(properties[property_name]["vertical_alignment"])
 
-    # Make the plot square (to match square molecule images)
-    ax.set_aspect("equal", "box")
+            # Make the plot square (to match square molecule images)
+            ax.set_aspect("equal", "box")
 
-    # Ensure no text labels are cut off
-    plt.tight_layout()
+            # Ensure no text labels are cut off
+            plt.tight_layout()
 
-    # Save plot
-    buf = BytesIO()
-    plt.savefig(buf, format=image_type)
-    plt.close()
-    buf.seek(0)
-    plot = buf.getvalue()
+            # Save plot
+            buf = BytesIO()
+            plt.savefig(buf, format=image_type)
+            buf.seek(0)
+            plot = buf.getvalue()
+        finally:
+            plt.close(fig)
 
     return plot
 

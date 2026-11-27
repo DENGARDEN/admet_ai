@@ -1,5 +1,6 @@
 """Defines the routes of the ADMET-AI Flask app."""
 
+import math
 from uuid import uuid4
 from tempfile import NamedTemporaryFile
 
@@ -29,6 +30,12 @@ from admet_ai.plot import (
 )
 from admet_ai.utils import get_drugbank_suffix
 from admet_ai.web.app import app
+from admet_ai.web.app.limiter import (
+    PredictionQueue,
+    QueueFullError,
+    QueueTimeoutError,
+    RateLimiter,
+)
 from admet_ai.web.app.models import get_admet_model
 from admet_ai.web.app.storage import (
     get_user_preds,
@@ -40,6 +47,33 @@ from admet_ai.web.app.utils import (
     replace_svg_dimensions,
     string_to_html_sup,
 )
+
+RATE_LIMITER = RateLimiter(
+    max_requests=app.config.get("RATE_LIMIT_REQUESTS"),
+    window_seconds=app.config.get("RATE_LIMIT_WINDOW", 60),
+)
+PREDICTION_QUEUE = PredictionQueue(
+    max_queue_size=app.config.get("MAX_QUEUE_SIZE"),
+    timeout=app.config.get("QUEUE_TIMEOUT"),
+)
+
+
+def configure_request_controls() -> None:
+    """Sync rate limiter and prediction queue settings from Flask app config."""
+    RATE_LIMITER.configure(
+        max_requests=app.config.get("RATE_LIMIT_REQUESTS"),
+        window_seconds=app.config.get("RATE_LIMIT_WINDOW", 60),
+    )
+    PREDICTION_QUEUE.configure(
+        max_queue_size=app.config.get("MAX_QUEUE_SIZE"),
+        timeout=app.config.get("QUEUE_TIMEOUT"),
+    )
+
+
+def _get_client_key() -> str:
+    """Return a client identifier for rate limiting."""
+    forwarded_for = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+    return forwarded_for or request.remote_addr or session.get("user_id", "unknown")
 
 
 def render(**kwargs) -> str:
@@ -67,7 +101,7 @@ def render(**kwargs) -> str:
 
 
 @app.route("/", methods=["GET", "POST"])
-def index() -> str:
+def index() -> str | tuple[str, int]:
     """Renders the page and makes predictions if the method is POST."""
     # Set up warnings
     warnings = []
@@ -81,7 +115,20 @@ def index() -> str:
         return render()
 
     # Save the user's text box input
-    session["text_smiles"] = request.form["text-smiles"]
+    session["text_smiles"] = request.form.get("text-smiles", "")
+
+    # Enforce per-client rate limit before parsing/running predictions
+    allowed, retry_after = RATE_LIMITER.allow(_get_client_key())
+    if not allowed:
+        wait_seconds = max(1, math.ceil(retry_after))
+        return (
+            render(
+                errors=[
+                    f"Rate limit exceeded. Please wait {wait_seconds} seconds before submitting another request."
+                ]
+            ),
+            429,
+        )
 
     # Get the SMILES from the request
     all_smiles, error = get_smiles_from_request()
@@ -112,10 +159,23 @@ def index() -> str:
     if len(all_smiles) == 0:
         return render(errors=["No valid SMILES strings given."])
 
-    # Make physicochemical and ADMET predictions (with DrugBank percentiles)
-    admet_model = get_admet_model()
-    admet_model.atc_code = session.get("atc_code")
-    all_preds = admet_model.predict(smiles=all_smiles)
+    # Serialize model inference through a bounded FIFO queue to prevent shared ADMETModel.atc_code race conditions
+    atc_code = session.get("atc_code")
+    try:
+        with PREDICTION_QUEUE.slot():
+            admet_model = get_admet_model()
+            admet_model.atc_code = atc_code
+            all_preds = admet_model.predict(smiles=all_smiles)
+    except QueueFullError:
+        return (
+            render(errors=["Server is currently busy handling other requests. Please try again shortly."]),
+            429,
+        )
+    except QueueTimeoutError:
+        return (
+            render(errors=["Prediction request timed out waiting in the queue. Please try again."]),
+            503,
+        )
 
     # Convert predictions to a dictionary mapping SMILES to property name to value
     smiles_to_property_id_to_pred: dict[str, dict[str, float]] = all_preds[
@@ -128,7 +188,7 @@ def index() -> str:
     # Create DrugBank reference plot
     drugbank_plot_svg = plot_drugbank_reference(
         preds_df=all_preds,
-        drugbank_df=get_drugbank(atc_code=session.get("atc_code")),
+        drugbank_df=get_drugbank(atc_code=atc_code),
         x_property_name=session.get("drugbank_x_task_name"),
         y_property_name=session.get("drugbank_y_task_name"),
         max_molecule_num=app.config["MAX_VISIBLE_MOLECULES"],
@@ -146,7 +206,7 @@ def index() -> str:
     radial_svgs = [
         plot_radial_summary(
             property_id_to_percentile=smiles_to_property_id_to_pred[smiles],
-            percentile_suffix=get_drugbank_suffix(session.get("atc_code")),
+            percentile_suffix=get_drugbank_suffix(atc_code),
         ).decode("utf-8")
         for smiles in all_smiles[:num_display_molecules]
     ]
