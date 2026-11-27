@@ -102,8 +102,9 @@ radial_description_tooltip %}
     <div id="use-text" class="collapse">
         <h3>Input</h3>
         <p>
-            <strong><u>Molecules:</u></strong> ADMET-AI can make predictions for up to <strong>{{
-            "{:,}".format(max_molecules) }}</strong> molecules at a time by (1)
+            {% set max_molecules_help_text = " up to <strong>{:,}</strong>".format(max_molecules) if max_molecules else " any number of" %}
+            <strong><u>Molecules:</u></strong> ADMET-AI can make predictions for{{ max_molecules_help_text | safe }}
+            molecules at a time by (1)
             providing SMILES (one per line) in the text box, (2) uploading a CSV file with SMILES, or (3) drawing a
             molecule using the interactive tool and then converting it to a SMILES.
         </p>
